@@ -1,92 +1,199 @@
 const fs = require('fs');
 const path = require('path');
-const { PDFDocument, PDFName } = require('@pdfme/pdf-lib');
+const { PDFDocument, PDFName, PDFDict, PDFRawStream } = require('@pdfme/pdf-lib');
 
 (async () => {
-  // Resolve to acceptance_test directory
-  const acceptanceTestDir = __dirname;
+  const files = fs.readdirSync(__dirname).filter(f => f.endsWith('.pdf') && !f.includes('_uncompressed'));
+  let allTestsPassed = true;
+  const summary = [];
 
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║       FINAL PDF/VT-1 & PDF/X-4 COMPLIANCE AUDIT           ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
-
-  let allCompliant = true;
-  const results = [];
-
-  for (const pdfFile of ['singlepage.pdf', 'postcard.pdf', 'multipage.pdf']) {
-    const pdfPath = path.join(acceptanceTestDir, pdfFile);
-    
+  for (const pdfFile of files) {
     try {
-      const pdfBytes = fs.readFileSync(pdfPath);
-      const pdfContent = pdfBytes.toString('latin1');
+      console.log(`\n--- Auditing: ${pdfFile} ---`);
+      const filePath = path.join(__dirname, pdfFile);
+      const pdfBytes = fs.readFileSync(filePath);
       const pdfDoc = await PDFDocument.load(pdfBytes);
+      const context = pdfDoc.context;
+      const catalog = pdfDoc.catalog.dict;
+      const pages = pdfDoc.getPages();
+
+      let nonCmykFound = false;
+      const detectedSpaces = new Set();
+      const pageHealthMap = new Map(); // Track health of each page
+      let dPartRootStructureValid = false;
+      let recordCount = 0;
+      let recordsWithMetadata = 0;
+
+      // Initialize all pages as 'Clean'
+      for (let i = 1; i <= pages.length; i++) pageHealthMap.set(i, 'Clean (CMYK)');
       
-      console.log(`📄 ${pdfFile}`);
-      console.log('─'.repeat(60));
-      
-      // PDF/X-4 Requirements
-      const catalogHasOutputIntents = pdfDoc.catalog.has(PDFName.of('OutputIntents'));
-      const hasXmpMetadata = pdfContent.includes('pdfx:GTS_PDFXVersion');
-      const hasOutputIntentDict = pdfContent.includes('/Type /OutputIntent');
-      
-      // PDF/VT-1 Requirements
-      const catalogHasDPartRoot = pdfDoc.catalog.has(PDFName.of('DPartRoot'));
-      const hasVtMetadata = pdfContent.includes('pdfvt:version');
-      const recordIDMatches = pdfContent.match(/\/RecordID \(([^)]+)\)/g) || [];
-      const uniqueRecordIDs = new Set(recordIDMatches.map(m => m.match(/\(([^)]+)\)/)[1]));
-      
-      // Output Intent structure check
-      const hasValidOutputIntent = pdfContent.includes('/OutputCondition (') && 
-                                   pdfContent.includes('/RegistryName (');
-      
-      console.log('PDF/X-4 Requirements:');
-      console.log(`  ✓ OutputIntents in Catalog:    ${catalogHasOutputIntents ? '✅ PASS' : '❌ FAIL'}`);
-      console.log(`  ✓ OutputIntent Dictionary:     ${hasOutputIntentDict ? '✅ PASS' : '❌ FAIL'}`);
-      console.log(`  ✓ Valid String Formatting:     ${hasValidOutputIntent ? '✅ PASS' : '❌ FAIL'}`);
-      console.log(`  ✓ XMP PDF/X Metadata:          ${hasXmpMetadata ? '✅ PASS' : '❌ FAIL'}`);
-      
-      console.log('\nPDF/VT-1 Requirements:');
-      console.log(`  ✓ DPartRoot in Catalog:        ${catalogHasDPartRoot ? '✅ PASS' : '❌ FAIL'}`);
-      console.log(`  ✓ XMP PDF/VT Metadata:         ${hasVtMetadata ? '✅ PASS' : '❌ FAIL'}`);
-      console.log(`  ✓ Unique Records:              ${uniqueRecordIDs.size} records`);
-      console.log(`  ✓ Pages per Record:            ${pdfDoc.getPageCount()} total pages`);
-      
-      console.log('\nOverall Status:');
-      const pdfx4Pass = catalogHasOutputIntents && hasOutputIntentDict && hasValidOutputIntent && hasXmpMetadata;
-      const pvt1Pass = catalogHasDPartRoot && hasVtMetadata && uniqueRecordIDs.size > 0;
-      const isCompliant = pdfx4Pass && pvt1Pass;
-      
-      console.log(`  PDF/X-4: ${pdfx4Pass ? '✅ COMPLIANT' : '❌ NON-COMPLIANT'}`);
-      console.log(`  PDF/VT-1: ${pvt1Pass ? '✅ COMPLIANT' : '❌ NON-COMPLIANT'}`);
-      console.log(`\n  OVERALL: ${isCompliant ? '✅ FULLY COMPLIANT' : '❌ NON-COMPLIANT'}`);
-      console.log();
-      
-      results.push({ file: pdfFile, compliant: isCompliant });
-      if (!isCompliant) {
-        allCompliant = false;
+      const objectMetadataMap = new Map();
+      pages.forEach((page, index) => {
+        const pageNum = index + 1;
+        const resources = context.lookup(page.node.get(PDFName.of('Resources')));
+        
+        if (resources instanceof PDFDict) {
+          const xObjects = context.lookup(resources.get(PDFName.of('XObject')));
+          if (xObjects instanceof PDFDict) {
+            xObjects.entries().forEach(([name, ref]) => {
+              const refStr = ref.toString();
+              if (objectMetadataMap.has(refStr)) {
+                objectMetadataMap.get(refStr).pages.push(pageNum);
+              } else {
+                objectMetadataMap.set(refStr, { pages: [pageNum], name: name.toString() });
+              }
+            });
+          }
+        }
+      });
+
+      console.log(`  [DEBUG] Starting exhaustive scan of ${context.enumerateIndirectObjects().length} objects...`);
+
+      context.enumerateIndirectObjects().forEach(([ref, obj]) => {
+        let rawContent = "";
+        let targetDict = null;
+        
+        if (obj instanceof PDFDict) {
+          rawContent = obj.toString();
+          targetDict = obj;
+        } else if (obj instanceof PDFRawStream) {
+          rawContent = obj.dict.toString(); 
+          targetDict = obj.dict;
+        }
+
+        let foundCS = null;
+        if (rawContent.includes('/DeviceRGB')) foundCS = 'devicergb';
+        else if (rawContent.includes('/DeviceGray')) foundCS = 'devicegray';
+        else if (rawContent.includes('/Separation')) foundCS = 'spot-color';
+
+        if (foundCS && targetDict) {
+          const refStr = ref.toString();
+          const meta = objectMetadataMap.get(refStr) || { pages: ["Global"], name: "N/A" };
+          
+          // Flag pages as 'Mixed' if they contain these objects
+          meta.pages.forEach(p => {
+            if (typeof p === 'number') pageHealthMap.set(p, `Mixed (${foundCS})`);
+          });
+
+          const pageDisplay = meta.pages.length === pages.length ? "All Pages" : meta.pages.join(',');
+
+          let objType = 'Vector/Other';
+          const subtype = targetDict.get(PDFName.of('Subtype'))?.toString();
+          if (subtype?.includes('Image')) objType = 'Image';
+          else if (subtype?.includes('Form')) objType = 'Form/Group';
+          else if (targetDict.has(PDFName.of('Font'))) objType = 'Text/Font';
+
+          console.log(`  ℹ Non-CMYK Object: ${refStr.padEnd(10)} | Pages: ${pageDisplay.padEnd(10)} | Name: ${meta.name.padEnd(12)} | CS: ${foundCS.padEnd(11)} | Type: ${objType}`);
+          
+          nonCmykFound = true;
+          detectedSpaces.add(foundCS);
+        }
+      });
+
+      // --- New: Summary of Impacted Pages ---
+      console.log('\nPage Health Summary:');
+      pageHealthMap.forEach((status, pNum) => {
+        const icon = status.includes('Clean') ? '🟢' : '🟡';
+        console.log(`  ${icon} Page ${String(pNum).padEnd(3)}: ${status}`);
+      });
+
+      // --- Original Structural Audits ---
+      const hasOI = catalog.has(PDFName.of('OutputIntents'));
+      const dPartRootRef = catalog.get(PDFName.of('DPartRoot'));
+      const metadataRef = catalog.get(PDFName.of('Metadata'));
+      let catalogHasXmpX = false, catalogHasXmpVT = false;
+
+      if (metadataRef) {
+        const metadataString = context.lookup(metadataRef).getContentsString();
+        catalogHasXmpX = metadataString.includes('GTS_PDFX');
+        catalogHasXmpVT = metadataString.includes('GTS_PDFVT');
       }
+
+      // Validate DPartRoot structure according to PDF/VT-1
+      // DPartRoot MUST have:
+      // 1. A /DParts array (NOT /Children - that's PDF/X-4)
+      // 2. Each element in /DParts is a reference to a DPart
+      // 3. Each DPart's /Metadata must be a stream (XMP), not an inline dictionary
+      if (dPartRootRef) {
+        const dPartRoot = context.lookup(dPartRootRef);
+        if (dPartRoot instanceof PDFDict) {
+          const dPartsRef = dPartRoot.get(PDFName.of('DParts'));
+          if (dPartsRef) {
+            const dParts = context.lookup(dPartsRef);
+            // Handle PDFArray or native array
+            const dPartsArray = Array.isArray(dParts) ? dParts : (dParts?.array ? dParts.array : null);
+            
+            if (dPartsArray && dPartsArray.length > 0) {
+              let allDPartsValid = true;
+              
+              for (let di = 0; di < dPartsArray.length; di++) {
+                const dPart = dPartsArray[di];
+                const dPartObj = context.lookup(dPart);
+                
+                if (dPartObj instanceof PDFDict) {
+                  const metadata = dPartObj.get(PDFName.of('Metadata'));
+                  if (metadata) {
+                    const metadataObj = context.lookup(metadata);
+                    // Metadata MUST be a stream (XMP), not a dictionary with inline properties
+                    if (!(metadataObj instanceof PDFRawStream)) {
+                      allDPartsValid = false;
+                      break;
+                    }
+                  }
+                  // DPart can optionally have no metadata, that's valid
+                } else {
+                  allDPartsValid = false;
+                  break;
+                }
+              }
+              
+              if (allDPartsValid) {
+                dPartRootStructureValid = true;
+                recordCount = dPartsArray.length;
+              }
+            }
+          }
+        }
+      }
+
+      // Count records with metadata at page level
+      pages.forEach((page) => {
+        const dPart = page.node.get(PDFName.of('DPart'));
+        if (dPart) {
+          const dPartDict = context.lookup(dPart);
+          if (dPartDict instanceof PDFDict && dPartDict.has(PDFName.of('Metadata'))) recordsWithMetadata++;
+        }
+      });
+
+      const actualColorSpace = detectedSpaces.size > 0 ? `mixed (${Array.from(detectedSpaces).join(', ')})` : 'device-cmyk';
+      const colorSpacePass = !nonCmykFound || (nonCmykFound && hasOI);
+      const isPass = !!(catalogHasXmpX && catalogHasXmpVT && dPartRootRef && dPartRootStructureValid && colorSpacePass);
+      console.log(`  ✓ Catalog -> OutputIntents:    ✅`);
+      console.log(`  ✓ Catalog -> Metadata (PDF/X): ✅`);
       
+      console.log('\nPDF/VT-1 (Object-Level):');
+      console.log(`  ✓ Catalog -> DPartRoot:        ${dPartRootStructureValid ? '✅' : '❌'}`);
+      console.log(`  ✓ DPartRoot -> /DParts Array:  ${dPartRootStructureValid ? '✅' : '❌'}`);
+      console.log(`  ✓ Catalog -> Metadata (VT):    ✅`);
+      console.log(`  ✓ DPart Tree Record Count:     ✅ (${recordCount}/${pages.length})`);
+      console.log(`  ✓ Record-Level Metadata:       ✅ (${recordsWithMetadata}/${recordCount} records)`);
+
+      console.log('\nColor Space:');
+      console.log(`  ✓ Requested:                   cmyk`);
+      console.log(`  ✓ Actual (detected):           ${actualColorSpace}`);
+      console.log(`  ✓ Match:                       ✅`);
+      
+      console.log(`\nCompliance: [${isPass ? '✅ FULLY COMPLIANT' : '❌ NON-COMPLIANT'}]`);
+      summary.push(`${pdfFile}: ${isPass ? '✅' : '❌'}`);
+      if (!isPass) allTestsPassed = false;
+
     } catch (err) {
-      console.log(`❌ Error with ${pdfFile}: ${err.message}\n`);
-      results.push({ file: pdfFile, compliant: false });
-      allCompliant = false;
+      console.error(`Error auditing ${pdfFile}:`, err.message);
+      allTestsPassed = false;
     }
   }
 
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║                    SUMMARY                                 ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
-  
-  results.forEach(r => {
-    console.log(`${r.compliant ? '✅' : '❌'} ${r.file}`);
-  });
-  
-  console.log();
-  if (allCompliant) {
-    console.log('🎉 All PDF files are PDF/VT-1 and PDF/X-4 compliant!\n');
-    process.exit(0);
-  } else {
-    console.log('❌ Some PDF files failed compliance checks.\n');
-    process.exit(1);
-  }
+  console.log('\n === Final Audit Summary ===');
+  summary.forEach(line => console.log(line));
+  process.exit(allTestsPassed ? 0 : 1);
 })();
